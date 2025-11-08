@@ -1,0 +1,17 @@
+name: Continuous Integration
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+
+  publish:
+    runs-on: ubuntu-latest
+    environment: test
+    env:
+      SERVER_JFROG: ${{ vars.SERVER_JFROG }}
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Debug env var llega desde Environment
+        run: echo "SERVER_JFROG='${{ vars.SERVER_JFROG }}'"

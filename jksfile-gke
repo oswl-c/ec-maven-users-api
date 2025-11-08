@@ -1,0 +1,129 @@
+pipeline {
+  agent { label 'controller' }
+
+  environment {
+    APP_NAME     = 'mi-application'
+    PROJECT_ID   = 'thermal-antenna-469417-r6'
+    REGION       = 'us-central1'
+    REPO         = 'cloud-jenkins-registry'
+    REGISTRY     = "${REGION}-docker.pkg.dev"
+    GCLOUD_CREDS = credentials('gcloud-creds') // JSON SA
+    CLUSTER_NAME = 'lab21-gke-v2'
+    K8S_NAMESPACE= 'lab'
+    // tag inmutable (usa GIT_COMMIT corto o BUILD_NUMBER si no existe)
+    IMAGE_TAG    = "${env.GIT_COMMIT?.take(7) ?: env.BUILD_NUMBER}"
+    IMAGE_BASEREF= "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${APP_NAME}"
+    IMAGE_NAME   = "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${APP_NAME}:latest"
+    IMAGE_IMMUT  = "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${APP_NAME}:${IMAGE_TAG}"
+  }
+
+  stages {
+
+    stage('Build con Maven') {
+      agent { docker { image 'maven:3.9.6-eclipse-temurin-17' } }
+      steps {
+        sh '''
+          set -eux
+          mvn -v
+          mvn clean package -DskipTests
+        '''
+        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true, onlyIfSuccessful: true
+        stash name: 'app-jar', includes: 'target/*.jar'
+      }
+    }
+
+    stage('Docker Build & Push (main)') {
+      when {
+        expression {
+          def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
+          b == 'main' || b == 'origin/main' || b == 'refs/heads/main' || b.endsWith('/main')
+        }
+      }
+      agent {
+        docker {
+          image 'docker:24-cli'
+          args '-v /var/run/docker.sock:/var/run/docker.sock -u 0:0'
+        }
+      }
+      steps {
+        script {
+          try {
+            copyArtifacts(
+              projectName: env.JOB_NAME,
+              selector: [$class: 'SpecificBuildSelector', buildNumber: "${env.BUILD_NUMBER}"],
+              filter: 'target/*.jar',
+              fingerprintArtifacts: true,
+              flatten: true,
+              target: 'target'
+            )
+          } catch (err) {
+            dir('target') { }
+            unstash 'app-jar'
+          }
+        }
+
+        sh '''
+          set -eux
+          docker --version
+          docker login -u _json_key --password-stdin "https://${REGISTRY}" < "${GCLOUD_CREDS}"
+
+          # build + 2 tags (inmutable y latest)
+          docker build -t "${IMAGE_IMMUT}" .
+          docker tag "${IMAGE_IMMUT}" "${IMAGE_NAME}"
+
+          docker push "${IMAGE_IMMUT}"
+          docker push "${IMAGE_NAME}"
+        '''
+      }
+    }
+
+    stage('Deploy a Kubernetes (main)') {
+      when {
+        expression {
+          def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
+          b == 'main' || b == 'origin/main' || b == 'refs/heads/main' || b.endsWith('/main')
+        }
+      }
+      agent { docker { image 'gcr.io/google.com/cloudsdktool/google-cloud-cli:latest'
+                       args '-u 0:0' } }
+      steps {
+        sh '''
+          set -eux
+    
+          # Dependencias mínimas
+          apt-get update
+          apt-get install -y gettext-base google-cloud-sdk-gke-gcloud-auth-plugin curl ca-certificates
+    
+          # kubectl (binario oficial)
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KVER="$(curl -sL https://dl.k8s.io/release/stable.txt)"
+            curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+            chmod +x /usr/local/bin/kubectl
+          fi
+    
+          export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+    
+          # Auth y kubeconfig
+          gcloud auth activate-service-account --key-file="${GCLOUD_CREDS}"
+          gcloud config set project "${PROJECT_ID}"
+          gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}"
+    
+          # Apply con sustitución
+          envsubst < k8s/namespace.yaml | kubectl apply -f -
+          envsubst < k8s/deployment.yaml | kubectl apply -f -
+          envsubst < k8s/service.yaml    | kubectl apply -f -
+          
+          cat k8s/deployment.yaml
+          cat k8s/service.yaml
+
+          kubectl -n "${K8S_NAMESPACE}" rollout restart deploy/${APP_NAME}
+          kubectl -n "${K8S_NAMESPACE}" rollout status  deploy/${APP_NAME} --timeout=10m
+
+          kubectl -n "${K8S_NAMESPACE}" get deploy,po,svc -o wide
+        '''
+      }
+    }
+
+
+  }
+}

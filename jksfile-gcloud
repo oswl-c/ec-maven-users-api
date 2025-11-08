@@ -1,0 +1,96 @@
+pipeline {
+  agent { label 'controller' }
+
+  environment {
+    APP_NAME     = 'mi-application'
+    PROJECT_ID   = 'thermal-antenna-469417-r6' //Poyecto de google
+    REGION       = 'us-central1'
+    REPO         = 'cloud-jenkins-registry'
+    REGISTRY     = "${REGION}-docker.pkg.dev"
+    GCLOUD_CREDS = credentials('gcloud-creds') // Secret file (ruta al JSON)
+    IMAGE_NAME   = "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${APP_NAME}:latest"
+  }
+
+  stages {
+    stage('Build con Maven') {
+      agent { docker { image 'maven:3.9.6-eclipse-temurin-17' } }
+      steps {
+        sh '''
+          set -eux
+          mvn -v
+          mvn clean package -DskipTests
+        '''
+        // Publica el jar y también lo deja listo como stash (fallback)
+        archiveArtifacts artifacts: 'target/*.jar', fingerprint: true, onlyIfSuccessful: true
+        stash name: 'app-jar', includes: 'target/*.jar'
+      }
+    }
+
+    stage('Docker Build & Push (main)') {
+      when {
+        expression {
+          def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
+          b == 'main' || b == 'origin/main' || b == 'refs/heads/main' || b.endsWith('/main')
+        }
+      }
+      agent {
+        docker {
+          image 'docker:24-cli'
+          args '-v /var/run/docker.sock:/var/run/docker.sock -u 0:0'
+        }
+      }
+      steps {
+        script {
+          try {
+            copyArtifacts(
+              projectName: env.JOB_NAME,
+              selector: [$class: 'SpecificBuildSelector', buildNumber: "${env.BUILD_NUMBER}"],
+              filter: 'target/*.jar',
+              fingerprintArtifacts: true,
+              flatten: true,
+              target: 'target'
+            )
+            echo 'copyArtifacts OK'
+          } catch (err) {
+            echo "copyArtifacts no disponible (${err}); usando fallback unstash"
+            dir('target') { /* asegura la carpeta destino */ }
+            unstash 'app-jar'
+          }
+        }
+
+        sh '''
+          set -eux
+          docker --version
+          docker login -u _json_key --password-stdin "https://${REGISTRY}" < "${GCLOUD_CREDS}"
+
+          echo "Building ${IMAGE_NAME}"
+          docker build -t "${IMAGE_NAME}" .
+          docker push "${IMAGE_NAME}"
+        '''
+      }
+    }
+
+    stage('Deploy a Cloud Run (main)') {
+      when {
+        expression {
+          def b = (env.BRANCH_NAME ?: env.GIT_BRANCH ?: '').trim()
+          b == 'main' || b == 'origin/main' || b == 'refs/heads/main' || b.endsWith('/main')
+        }
+      }
+      agent { docker { image 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim' } }
+      steps {
+        sh '''
+          set -eux
+          gcloud auth activate-service-account --key-file="${GCLOUD_CREDS}"
+          gcloud config set project "${PROJECT_ID}"
+
+          gcloud run deploy "${APP_NAME}" \
+            --image "${IMAGE_NAME}" \
+            --region "${REGION}" \
+            --platform managed \
+            --allow-unauthenticated
+        '''
+      }
+    }
+  }
+}
